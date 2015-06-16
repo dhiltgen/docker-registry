@@ -15,6 +15,8 @@ json = compat.json
 from . import storage
 from . import toolkit
 from .app import app
+# golang
+from .lib import golangconnector
 from .lib import mirroring
 from .lib import signals
 
@@ -23,6 +25,9 @@ store = storage.load()
 logger = logging.getLogger(__name__)
 RE_USER_AGENT = re.compile('([^\s/]+)/([^\s/]+)')
 RE_VALID_TAG = re.compile('^[\w][\w.-]{0,127}$')
+
+# golang
+gconnect = golangconnector.Connector(store)
 
 
 @app.route('/v1/repositories/<path:repository>/properties', methods=['PUT'])
@@ -89,7 +94,25 @@ def _get_tags(namespace, repository):
     logger.debug("[get_tags] namespace={0}; repository={1}".format(namespace,
                  repository))
     try:
-        data = get_tags(namespace=namespace, repository=repository)
+        data = None
+        try:
+            data = get_tags(namespace=namespace, repository=repository)
+        except:
+            pass
+        # golang
+        if True:  # not namespace == 'library':
+            try:
+                golangdata = gconnect.tags(namespace, repository)
+                spoof = data
+                if not spoof:
+                    spoof = dict()
+                if golangdata:
+                    spoof.update(golangdata)
+                    data = spoof
+            except:
+                pass
+        if not data:
+            raise exceptions.FileNotFoundError('No tags!')
     except exceptions.FileNotFoundError:
         return toolkit.api_error('Repository not found', 404)
     return toolkit.response(data)
@@ -104,10 +127,15 @@ def get_tag(namespace, repository, tag):
                  namespace, repository, tag))
     data = None
     tag_path = store.tag_path(namespace, repository, tag)
-    try:
-        data = store.get_content(tag_path)
-    except exceptions.FileNotFoundError:
-        return toolkit.api_error('Tag not found', 404)
+    # golang
+    if True:  # not namespace == 'library':
+        data = gconnect.image(namespace, repository, tag)
+    # If nothing, fallback to the python datastore
+    if not data:
+        try:
+            data = store.get_content(tag_path)
+        except exceptions.FileNotFoundError:
+            return toolkit.api_error('Tag not found', 404)
     return toolkit.response(data)
 
 
@@ -198,6 +226,15 @@ def put_tag(namespace, repository, tag):
     if not store.exists(store.image_json_path(data)):
         return toolkit.api_error('Image not found', 404)
     store.put_content(store.tag_path(namespace, repository, tag), data)
+
+    # golang
+    # Force delete a v2 image that might be there (only non official to avoid snafoos)
+    if not namespace == 'library':
+        try:
+            gconnect.delete(namespace, repository, tag)
+        except Exception as e:
+            logger.debug('Exception while deleting on the golang storage %s' % e)
+
     sender = flask.current_app._get_current_object()
     signals.tag_created.send(sender, namespace=namespace,
                              repository=repository, tag=tag, value=data)
@@ -234,10 +271,16 @@ def delete_tag(namespace, repository, tag):
 @toolkit.requires_auth
 def _delete_tag(namespace, repository, tag):
     # XXX backends are inconsistent on this - some will throw, but not all
+    # golang
+    try:
+        gconnect.delete(namespace, repository, tag)
+    except Exception as e:
+        logger.debug('Exception while deleting on the golang storage %s' % e)
     try:
         delete_tag(namespace=namespace, repository=repository, tag=tag)
-    except exceptions.FileNotFoundError:
-        return toolkit.api_error('Tag not found: %s' % tag, 404)
+    except exceptions.FileNotFoundError as e:
+        logger.debug('Exception in v1 %s' % e)
+        # return toolkit.api_error('Tag not found', 404)
     return toolkit.response()
 
 
@@ -260,6 +303,15 @@ def delete_repository(namespace, repository):
     """
     logger.debug("[delete_repository] namespace={0}; repository={1}".format(
                  namespace, repository))
+    # XXX golang
+    try:
+        golangdata = gconnect.tags(namespace, repository)
+        for tag_name, tag_content in golangdata:
+            # golang
+            gconnect.delete(namespace, repository, tag_name)
+    except Exception as e:
+        logger.debug('Exception while deleting on the golang storage %s' % e)
+
     try:
         for tag_name, tag_content in get_tags(
                 namespace=namespace, repository=repository).items():
@@ -268,10 +320,7 @@ def delete_repository(namespace, repository):
         # TODO(wking): remove images, but may need refcounting
         store.remove(store.repository_path(
             namespace=namespace, repository=repository))
-    except exceptions.FileNotFoundError:
-        return toolkit.api_error('Repository not found', 404)
-    else:
-        sender = flask.current_app._get_current_object()
-        signals.repository_deleted.send(
-            sender, namespace=namespace, repository=repository)
+    except Exception as e:
+        logger.debug('Exception in v1 delete %s' % e)
+
     return toolkit.response()

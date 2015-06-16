@@ -3,6 +3,7 @@
 import datetime
 import functools
 import logging
+import re
 import time
 
 import flask
@@ -17,6 +18,8 @@ from .app import app
 from .app import cfg
 from .lib import cache
 from .lib import checksums
+# golang
+from .lib import golangconnector
 from .lib import layers
 from .lib import mirroring
 from .lib import signals
@@ -27,6 +30,10 @@ from .lib.xtarfile import tarfile
 
 store = storage.load()
 logger = logging.getLogger(__name__)
+_re_hex_image_id = re.compile(r'^([a-f0-9]{16}|[a-f0-9]{64})$')
+
+# golang
+gconnect = golangconnector.Connector(store)
 
 
 def require_completion(f):
@@ -36,6 +43,16 @@ def require_completion(f):
         if store.exists(store.image_mark_path(kwargs['image_id'])):
             return toolkit.api_error('Image is being uploaded, retry later')
         return f(*args, **kwargs)
+    return wrapper
+
+
+def valid_image_id(f):
+    @functools.wraps(f)
+    def wrapper(*args, **kwargs):
+        image_id = kwargs.get('image_id', '')
+        if _re_hex_image_id.match(image_id):
+            return f(*args, **kwargs)
+        return toolkit.api_error("Invalid image ID", 404)
     return wrapper
 
 
@@ -82,7 +99,15 @@ def _get_image_layer(image_id, headers=None, bytes_range=None):
     # offload a lot of expensive I/O and get faster I/O
     if cfg.storage_redirect:
         try:
-            content_redirect_url = store.content_redirect_url(path)
+            # golang
+            try:
+                gopath = gconnect.layer(image_id)
+                content_redirect_url = store.content_redirect_url(
+                    json.loads(gopath)['gopath'] if gopath else path
+                )
+            except Exception as e:
+                logger.debug('Fail, but survive %s' % e)
+                content_redirect_url = store.content_redirect_url(path)
             if content_redirect_url:
                 return flask.redirect(content_redirect_url, 302)
         except IOError as e:
@@ -90,6 +115,9 @@ def _get_image_layer(image_id, headers=None, bytes_range=None):
 
     status = None
     layer_size = 0
+
+    gopath = gconnect.layer(image_id)
+    path = json.loads(gopath)['gopath'] if gopath else path
 
     if not store.exists(path):
         raise exceptions.FileNotFoundError("Image layer absent from store")
@@ -120,17 +148,22 @@ def _get_image_layer(image_id, headers=None, bytes_range=None):
 def _get_image_json(image_id, headers=None):
     if headers is None:
         headers = {}
-    data = store.get_content(store.image_json_path(image_id))
-    try:
-        size = store.get_size(store.image_layer_path(image_id))
-        headers['X-Docker-Size'] = str(size)
-    except exceptions.FileNotFoundError:
-        pass
-    try:
-        csums = load_checksums(image_id)
-        headers['X-Docker-Checksum-Payload'] = csums
-    except exceptions.FileNotFoundError:
-        pass
+    # golang
+    data = gconnect.layer(image_id)
+    if data:
+        data = json.dumps(json.loads(data)['legacy'])
+    else:
+        data = store.get_content(store.image_json_path(image_id))
+        try:
+            size = store.get_size(store.image_layer_path(image_id))
+            headers['X-Docker-Size'] = str(size)
+        except exceptions.FileNotFoundError:
+            pass
+        try:
+            csums = load_checksums(image_id)
+            headers['X-Docker-Payload-Checksum'] = csums
+        except exceptions.FileNotFoundError:
+            pass
     return toolkit.response(data, headers=headers, raw=True)
 
 
@@ -171,6 +204,7 @@ def _valid_bytes_range(bytes_range):
 
 @app.route('/v1/images/<image_id>/layer', methods=['GET'])
 @toolkit.requires_auth
+@valid_image_id
 @require_completion
 @toolkit.valid_image_id
 @set_cache_headers
@@ -183,8 +217,12 @@ def get_image_layer(image_id, headers):
             bytes_range = _parse_bytes_range()
         repository = toolkit.get_repository()
         if repository and store.is_private(*repository):
-            if not toolkit.validate_parent_access(image_id):
-                return toolkit.api_error('Image not found', 404)
+            # This is not ideal
+            ongolang = gconnect.layer(image_id)
+            # Private, no v2 spoof, must check
+            if not ongolang:
+                if not toolkit.validate_parent_access(image_id):
+                    return toolkit.api_error('Image not found', 404)
         # If no auth token found, either standalone registry or privileged
         # access. In both cases, access is always "public".
         return _get_image_layer(image_id, headers, bytes_range)
@@ -267,8 +305,12 @@ def get_image_json(image_id, headers):
     try:
         repository = toolkit.get_repository()
         if repository and store.is_private(*repository):
-            if not toolkit.validate_parent_access(image_id):
-                return toolkit.api_error('Image not found', 404)
+            ongolang = gconnect.layer(image_id)
+            # Private, no v2 spoof, must check
+            # This is not ideal
+            if not ongolang:
+                if not toolkit.validate_parent_access(image_id):
+                    return toolkit.api_error('Image not found', 404)
         # If no auth token found, either standalone registry or privileged
         # access. In both cases, access is always "public".
         return _get_image_json(image_id, headers)
@@ -283,12 +325,17 @@ def get_image_json(image_id, headers):
 @set_cache_headers
 @mirroring.source_lookup(cache=True, stream=False)
 def get_image_ancestry(image_id, headers):
-    ancestry_path = store.image_ancestry_path(image_id)
-    try:
-        # Note(dmp): unicode patch
-        data = store.get_json(ancestry_path)
-    except exceptions.FileNotFoundError:
-        return toolkit.api_error('Image not found', 404)
+    # golang
+    data = gconnect.layer(image_id)
+    if data:
+        data = json.loads(data)['ancestry']
+    else:
+        ancestry_path = store.image_ancestry_path(image_id)
+        try:
+            # Note(dmp): unicode patch
+            data = store.get_json(ancestry_path)
+        except exceptions.FileNotFoundError:
+            return toolkit.api_error('Image not found', 404)
     return toolkit.response(data, headers=headers)
 
 
@@ -329,6 +376,7 @@ def load_checksums(image_id):
 
 
 @app.route('/v1/images/<image_id>/json', methods=['PUT'])
+@valid_image_id
 @toolkit.requires_auth
 @toolkit.valid_image_id
 def put_image_json(image_id):
